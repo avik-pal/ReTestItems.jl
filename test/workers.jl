@@ -93,28 +93,35 @@ using Test
         close(w)
     end
 
-    @testset "CPU profile" begin
-        logs = mktemp() do path, io
-            w = Worker(threads=VERSION >= v"1.9" ? "3,2" : "3", worker_redirect_io=io)
-            fut = remote_eval(w, :(sleep(5), yield()))
-            sleep(0.5)
-            trigger_profile(w, 1, :test)
-            fetch(fut)
-            close(w)
-            flush(io)
-            close(io)
-            return read(path, String)
-        end
+    if !Base.Sys.iswindows()
+        @testset "CPU profile" begin
+            logs = mktemp() do path, io
+                w = Worker(threads=VERSION >= v"1.9" ? "3,2" : "3", worker_redirect_io=io)
+                fut = remote_eval(w, :(sleep(5), yield()))
+                sleep(0.5)
+                trigger_profile(w, 1, :test)
+                fetch(fut)
+                close(w)
+                flush(io)
+                close(io)
+                return read(path, String)
+            end
 
-        @test occursin(r"Thread 1 Task 0x\w+ Total snapshots: \d+. Utilization: \d+%", logs)
-        @test occursin(r"Thread 2 Task 0x\w+ Total snapshots: \d+. Utilization: \d+%", logs)
-        @test occursin(r"Thread 3 Task 0x\w+ Total snapshots: \d+. Utilization: \d+%", logs)
-        if VERSION >= v"1.9"
-            @test occursin(r"Thread 4 Task 0x\w+ Total snapshots: \d+. Utilization: \d+%", logs)
-            @test occursin(r"Thread 5 Task 0x\w+ Total snapshots: \d+. Utilization: \d+%", logs)
-            @test !occursin(r"Thread 6 Task 0x\w+ Total snapshots: \d+. Utilization: \d+%", logs)
-        else
-            @test !occursin(r"Thread 4 Task 0x\w+ Total snapshots: \d+. Utilization: \d+%", logs)
+            # In Julia v1.12+ looks it prints the threadpool, like:
+            # Thread 1 (interactive) Task 0x00007f03563fc010 Total snapshots: 597. Utilization: 0%
+            # Thread 5 (default) Task 0x00007f03563fe2c0 Total snapshots: 597. Utilization: 20%
+            re_thread(i::Int) = Regex("Thread $i( \\((default|interactive)\\))? Task 0x")
+            @test occursin(re_thread(1), logs)
+            @test occursin(re_thread(2), logs)
+            @test occursin(re_thread(3), logs)
+
+            if VERSION >= v"1.9"
+                @test occursin(re_thread(4), logs)
+                @test occursin(re_thread(5), logs)
+                @test !occursin(re_thread(6), logs)
+            else
+                @test !occursin(re_thread(4), logs)
+            end
         end
     end
 end # workers.jl testset

@@ -11,14 +11,21 @@ using ReTestItems
     # let's test this exhaustively for 1-10 testitems across 1-10 workers.
     for nworkers in 1:10
         for nitems in 1:10
-            testitems = [@testitem("ti-$i", _run=false, begin end) for i in 1:nitems]
-            starts = get_starting_testitems(TestItems(graph, testitems), nworkers)
-            startitems = [x for x in starts if !isnothing(x)]
-            @test length(starts) == nworkers
-            @test length(startitems) == min(nworkers, nitems)
-            @test allunique(ti.name for ti in startitems)
+            for is_sorted in (true, false)
+                testitems = [@testitem("ti-$i", _run=false, begin end) for i in 1:nitems]
+                starts = get_starting_testitems(TestItems(graph, testitems), nworkers; is_sorted)
+                startitems = [x for x in starts if !isnothing(x)]
+                @test length(starts) == nworkers
+                @test length(startitems) == min(nworkers, nitems)
+                @test allunique(ti.name for ti in startitems)
+            end
         end
     end
+    # the `is_sorted` case just returns the first `n` items
+    n = 3
+    testitems = [@testitem("ti-$i", _run=false, begin end) for i in 1:(2n)]
+    starts = get_starting_testitems(TestItems(graph, testitems), n; is_sorted=true)
+    @test starts == testitems[1:n]
 end
 
 @testset "is_test_file" begin
@@ -92,17 +99,18 @@ end
     shouldrun = TestItemFilter(Returns(true), nothing, nothing)
     verbose_results = false
     report = false
+    project = touch(joinpath(mktempdir(), "Project.toml"))
 
     # Requesting only non-existent files/dirs should result in no files being included
-    ti, setups = include_testfiles!("proj", "/this/file/", ("/this/file/is/not/a/t-e-s-tfile.jl",), shouldrun, verbose_results, report)
+    ti, setups = include_testfiles!("proj", project, ("/this/file/is/not/a/t-e-s-tfile.jl",), shouldrun, verbose_results, report)
     @test isempty(ti.testitems)
     @test isempty(setups)
 
-    ti, setups = include_testfiles!("proj", "/this/file/", ("/this/file/does/not/exist/imaginary_tests.jl",), shouldrun, verbose_results, report)
+    ti, setups = include_testfiles!("proj", project, ("/this/file/does/not/exist/imaginary_tests.jl",), shouldrun, verbose_results, report)
     @test isempty(ti.testitems)
     @test isempty(setups)
 
-    ti, setups = include_testfiles!("proj", "/this/dir/", ("/this/dir/does/not/exist/", "/this/dir/also/not/exist/"), shouldrun, verbose_results, report)
+    ti, setups = include_testfiles!("proj", project, ("/this/dir/does/not/exist/", "/this/dir/also/not/exist/"), shouldrun, verbose_results, report)
     @test isempty(ti.testitems)
     @test isempty(setups)
 
@@ -169,7 +177,8 @@ end # `include_testfiles!` testset
 @testset "report_empty_testsets" begin
     using ReTestItems: TestItem, report_empty_testsets, PerfStats, ScheduledForEvaluation
     using Test: DefaultTestSet, Fail, Error
-    ti = TestItem(Ref(42), "Dummy TestItem", "DummyID", [], false, [], 0, nothing, false, nothing, "source/path", 42, ".", nothing)
+    path = joinpath("source", "path")
+    ti = TestItem(Ref(42), "Dummy TestItem", "DummyID", [], false, [], 0, nothing, false, nothing, path, 42, ".", nothing)
 
     ts = DefaultTestSet("Empty testset")
     report_empty_testsets(ti, ts)
@@ -179,7 +188,7 @@ end # `include_testfiles!` testset
     push!(ts.results, DefaultTestSet("Empty testset"))
     # Only the inner testset is considered empty
     @test_logs (:warn, """
-        Test item "Dummy TestItem" at source/path:42 contains test sets without tests:
+        Test item "Dummy TestItem" at $(path):42 contains test sets without tests:
         "Empty testset"
         """) begin
         report_empty_testsets(ti, ts)
@@ -190,7 +199,7 @@ end # `include_testfiles!` testset
     push!(ts.results, DefaultTestSet("Empty testset 2"))
     # Only the inner testsets are considered empty
     @test_logs (:warn, """
-        Test item "Dummy TestItem" at source/path:42 contains test sets without tests:
+        Test item "Dummy TestItem" at $(path):42 contains test sets without tests:
         "Empty testset 1"
         "Empty testset 2"
         """) begin
@@ -263,22 +272,22 @@ end
     @assert !ispath("foo")
     @test _validated_paths(("foo",), false) == ()
     @test_logs (:warn, "No such path \"foo\"") _validated_paths(("foo",), false)
-    @test_throws ArgumentError("No such path \"foo\"") _validated_paths(("foo",), true)
+    @test_throws ReTestItems.NoTestException("No such path \"foo\"") _validated_paths(("foo",), true)
 
     @assert isfile(test_file)
     @assert !ispath("foo")
     paths = (test_file, "foo",)
     @test _validated_paths(paths, false) == (test_file,)
     @test_logs (:warn, "No such path \"foo\"") _validated_paths(paths, false)
-    @test_throws ArgumentError("No such path \"foo\"") _validated_paths(paths, true)
+    @test_throws ReTestItems.NoTestException("No such path \"foo\"") _validated_paths(paths, true)
 
     nontest_file = joinpath(testfiles_dir, "_empty_file.jl")
     @assert isfile(nontest_file)
     @assert !ReTestItems.is_test_file(nontest_file)
     @assert !ReTestItems.is_testsetup_file(nontest_file)
     @test _validated_paths((nontest_file,), false) == ()
-    @test_logs (:warn, "\"$nontest_file\" is not a test file") _validated_paths((nontest_file,), false)
-    @test_throws ArgumentError("\"$nontest_file\" is not a test file") _validated_paths((nontest_file,), true)
+    @test_logs (:warn, "$(repr(nontest_file)) is not a test file") _validated_paths((nontest_file,), false)
+    @test_throws ReTestItems.NoTestException("$(repr(nontest_file)) is not a test file") _validated_paths((nontest_file,), true)
 end
 
 @testset "skiptestitem" begin
@@ -299,7 +308,7 @@ end
 end
 
 @testset "should_skip" begin
-    should_skip = ReTestItems.should_skip
+    using ReTestItems: should_skip
 
     ti = @testitem("x", skip=true, _run=false, begin end)
     @test should_skip(ti)
@@ -383,25 +392,27 @@ end
 
 @testset "nestedrelpath" begin
     using ReTestItems: nestedrelpath
-    @assert Base.Filesystem.path_separator == "/"
-    path = "test/dir/foo_test.jl"
-    @test nestedrelpath(path, "test")  == relpath(path, "test")  == "dir/foo_test.jl"
-    @test nestedrelpath(path, "test/") == relpath(path, "test/") == "dir/foo_test.jl"
-    @test nestedrelpath(path, "test/dir")  == relpath(path, "test/dir")  == "foo_test.jl"
-    @test nestedrelpath(path, "test/dir/") == relpath(path, "test/dir/") == "foo_test.jl"
-    @test nestedrelpath(path, "test/dir/foo_test.jl") == relpath(path, "test/dir/foo_test.jl") == "."
+    if !Base.Sys.iswindows()
+        @assert Base.Filesystem.path_separator == "/"
+        path = "test/dir/foo_test.jl"
+        @test nestedrelpath(path, "test")  == relpath(path, "test")  == "dir/foo_test.jl"
+        @test nestedrelpath(path, "test/") == relpath(path, "test/") == "dir/foo_test.jl"
+        @test nestedrelpath(path, "test/dir")  == relpath(path, "test/dir")  == "foo_test.jl"
+        @test nestedrelpath(path, "test/dir/") == relpath(path, "test/dir/") == "foo_test.jl"
+        @test nestedrelpath(path, "test/dir/foo_test.jl") == relpath(path, "test/dir/foo_test.jl") == "."
 
-    # unlike `relpath`: if `startdir` is not a prefix of `path`, the assumption is violated,
-    # and `path` is just returned as-is
-    @test nestedrelpath(path, "test/dir/foo_") == "test/dir/foo_test.jl"
-    @test nestedrelpath(path, "test/dir/other") == "test/dir/foo_test.jl"
-    @test nestedrelpath(path, "test/dir/other/bar_test.jl") == "test/dir/foo_test.jl"
+        # unlike `relpath`: if `startdir` is not a prefix of `path`, the assumption is violated,
+        # and `path` is just returned as-is
+        @test nestedrelpath(path, "test/dir/foo_") == "test/dir/foo_test.jl"
+        @test nestedrelpath(path, "test/dir/other") == "test/dir/foo_test.jl"
+        @test nestedrelpath(path, "test/dir/other/bar_test.jl") == "test/dir/foo_test.jl"
 
-    # leading '/' doesn't get ignored or stripped
-    @test nestedrelpath("/a/b/c", "/a/b") == "c"
-    @test nestedrelpath("/a/b/c", "a/b") == "/a/b/c"
-    @test nestedrelpath("/a/b", "/a/b/c") == "/a/b"
-    @test nestedrelpath("/a/b", "c") == "/a/b"
+        # leading '/' doesn't get ignored or stripped
+        @test nestedrelpath("/a/b/c", "/a/b") == "c"
+        @test nestedrelpath("/a/b/c", "a/b") == "/a/b/c"
+        @test nestedrelpath("/a/b", "/a/b/c") == "/a/b"
+        @test nestedrelpath("/a/b", "c") == "/a/b"
+    end
 end
 
 end # internals.jl testset

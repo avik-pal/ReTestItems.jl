@@ -6,8 +6,7 @@ using Test: Test, DefaultTestSet, TestSetException
 using .Threads: @spawn, nthreads
 using Pkg: Pkg
 using TestEnv
-using Logging
-using LoggingExtras
+using Logging: current_logger, with_logger
 
 export runtests, runtestitem
 export @testsetup, @testitem
@@ -24,18 +23,47 @@ else
     const errmon = identity
 end
 
+# Used by failures_first to sort failures before unseen before passes.
+@enum _TEST_STATUS::UInt8 begin
+    _FAILED = 0
+    _UNSEEN = 1
+    _PASSED = 2
+end
+const GLOBAL_TEST_STATUS = Dict{String,_TEST_STATUS}()
+reset_test_status!() = (empty!(GLOBAL_TEST_STATUS); nothing)
+_status_when_last_seen(ti) = get(GLOBAL_TEST_STATUS, ti.id, _UNSEEN)
+function _cache_status!(ti)
+    status = ti.is_non_pass[] ? _FAILED : _PASSED
+    GLOBAL_TEST_STATUS[ti.id] = status
+end
+
 # We use the Test.jl stdlib `failfast` mechanism to implement `testitem_failfast`, but that
 # feature was only added in Julia v1.9, so we define these shims so our code can be
 # compatible with earlier Julia versions, with `testitem_failfast` just having no effect.
 if isdefined(Test, :FailFastError)
-    TestFailFastError = Test.FailFastError
+    if isdefined(Test, :is_failfast_error)
+        # https://github.com/JuliaLang/julia/pull/58695
+        is_failfast_error = Test.is_failfast_error
+    else
+        is_failfast_error(err::Test.FailFastError) = true
+        is_failfast_error(err::LoadError) = is_failfast_error(err.error)
+        is_failfast_error(err) = false
+    end
     CompatDefaultTestSet(a...; kw...) = DefaultTestSet(a...; kw...)
 else # @testset does not yet support `failfast`
-    TestFailFastError = Base.Bottom
+    is_failfast_error(err) = false
     # ignore `failfast` argument to DefaultTestSet
     CompatDefaultTestSet(a...; failfast::Bool=false, kw...) = DefaultTestSet(a...; kw...)
 end
 
+struct NoTestException <: Exception
+    msg::String
+end
+# Three argument `showerror` with the `backtrace` keyword to swallow the backtrace,
+# like for `Test.TestSetException`.
+function Base.showerror(io::IO, exc::NoTestException, bt; backtrace=true)
+    printstyled(io, exc.msg; color=Base.error_color())
+end
 
 # copyied from REPL.jl
 function softscope(@nospecialize ex)
@@ -66,6 +94,7 @@ function softscope_all!(@nospecialize ex)
     end
 end
 
+include("debug.jl")
 include("workers.jl")
 using .Workers
 include("macros.jl")
@@ -75,17 +104,19 @@ include("log_capture.jl")
 include("filtering.jl")
 
 function __init__()
-    DEFAULT_STDOUT[] = stdout
-    DEFAULT_STDERR[] = stderr
-    DEFAULT_LOGSTATE[] = Base.CoreLogging._global_logstate
-    DEFAULT_LOGGER[] = Base.CoreLogging._global_logstate.logger
-    # Disable killing workers based on memory pressure on MacOS til calculations fixed.
-    # TODO: fix https://github.com/JuliaTesting/ReTestItems.jl/issues/113
-    @static if Sys.isapple()
-        DEFAULT_MEMORY_THRESHOLD[] = 1.0
+    if ccall(:jl_generating_output, Cint, ()) == 0 # not precompiling
+        DEFAULT_STDOUT[] = stdout
+        DEFAULT_STDERR[] = stderr
+        DEFAULT_LOGSTATE[] = Base.CoreLogging._global_logstate
+        DEFAULT_LOGGER[] = Base.CoreLogging._global_logstate.logger
+        # Disable killing workers based on memory pressure on MacOS til calculations fixed.
+        # TODO: fix https://github.com/JuliaTesting/ReTestItems.jl/issues/113
+        @static if Sys.isapple()
+            DEFAULT_MEMORY_THRESHOLD[] = 1.0
+        end
+        # Defer setting up the temp folder for pkgimage relocability
+        RETESTITEMS_TEMP_FOLDER[] = mkpath(joinpath(tempdir(), "ReTestItemsTempLogsDirectory"))
     end
-    # Defer setting up the temp folder for pkgimage relocability
-    RETESTITEMS_TEMP_FOLDER[] = mkpath(joinpath(tempdir(), "ReTestItemsTempLogsDirectory"))
     return nothing
 end
 
@@ -118,11 +149,11 @@ function _validated_paths(paths, should_throw::Bool)
     return filter(paths) do p
         if !ispath(p)
             msg = "No such path $(repr(p))"
-            should_throw ? throw(ArgumentError(msg)) : @warn msg
+            should_throw ? throw(NoTestException(msg)) : @warn msg
             return false
         elseif !(is_test_file(p) || is_testsetup_file(p)) && isfile(p)
             msg = "$(repr(p)) is not a test file"
-            should_throw ? throw(ArgumentError(msg)) : @warn msg
+            should_throw ? throw(NoTestException(msg)) : @warn msg
             return false
         else
             return true
@@ -228,6 +259,9 @@ will be run.
   Defaults to the value passed to the `failfast` keyword.
   If a `@testitem` sets its own `failfast` keyword, then that takes precedence.
   Note that the `testitem_failfast` keyword only takes effect in Julia v1.9+ and is ignored in earlier Julia versions.
+- `failures_first::Bool=true`: if `true`, first runs test items that failed the last time
+  they ran, followed by new test items, followed by test items that passed the last time they ran.
+  Can also be set using the `RETESTITEMS_FAILURES_FIRST` environment variable.
 """
 function runtests end
 
@@ -257,6 +291,7 @@ end
     timeout_profile_wait::Int
     memory_threshold::Float64
     gc_between_testitems::Bool
+    failures_first::Bool
 end
 
 
@@ -281,6 +316,7 @@ function runtests(
     gc_between_testitems::Bool=parse(Bool, get(ENV, "RETESTITEMS_GC_BETWEEN_TESTITEMS", string(nworkers > 1))),
     failfast::Bool=parse(Bool, get(ENV, "RETESTITEMS_FAILFAST", "false")),
     testitem_failfast::Bool=parse(Bool, get(ENV, "RETESTITEMS_TESTITEM_FAILFAST", string(failfast))),
+    failures_first::Bool=parse(Bool, get(ENV, "RETESTITEMS_FAILURES_FIRST", "true")),
 )
     nworker_threads = _validated_nworker_threads(nworker_threads)
     paths′ = _validated_paths(paths, validate_paths)
@@ -301,10 +337,10 @@ function runtests(
     (timeout_profile_wait > 0 && Sys.iswindows()) && @warn "CPU profiles on timeout is not supported on Windows, ignoring `timeout_profile_wait`"
     mkpath(RETESTITEMS_TEMP_FOLDER[]) # ensure our folder wasn't removed
     save_current_stdio()
-    cfg = _Config(; nworkers, nworker_threads, worker_init_expr, test_end_expr, testitem_timeout, testitem_failfast, failfast, retries, logs, report, verbose_results, timeout_profile_wait, memory_threshold, gc_between_testitems)
+    cfg = _Config(; nworkers, nworker_threads, worker_init_expr, test_end_expr, testitem_timeout, testitem_failfast, failfast, retries, logs, report, verbose_results, timeout_profile_wait, memory_threshold, gc_between_testitems, failures_first)
     debuglvl = Int(debug)
     if debuglvl > 0
-        LoggingExtras.withlevel(LoggingExtras.Debug; verbosity=debuglvl) do
+        withdebug(debuglvl) do
             _runtests(ti_filter, paths′, cfg)
         end
     else
@@ -372,14 +408,26 @@ function _runtests_in_current_env(
     inc_time = time()
     @debugv 1 "Including tests in $paths"
     testitems, _ = include_testfiles!(proj_name, projectfile, paths, ti_filter, cfg.verbose_results, cfg.report)
+    @debugv 1 "Done including tests in $paths"
     nworkers = cfg.nworkers
     nworker_threads = cfg.nworker_threads
     ntestitems = length(testitems.testitems)
-    @debugv 1 "Done including tests in $paths"
-    @info "Finished scanning for test items in $(round(time() - inc_time, digits=2)) seconds." *
-        " Scheduling $ntestitems tests on pid $(Libc.getpid())" *
+    @info "Finished scanning for test items in $(round(time() - inc_time, digits=2)) seconds."
+    if ntestitems == 0
+        throw(NoTestException("No test items found."))
+    end
+    @info "Scheduling $ntestitems tests on pid $(Libc.getpid())" *
         (nworkers == 0 ? "" : " with $nworkers worker processes and $nworker_threads threads per worker.")
     try
+        if cfg.failures_first && !isempty(GLOBAL_TEST_STATUS)
+            sort!(testitems.testitems; by=_status_when_last_seen)
+            foreach(enumerate(testitems.testitems)) do (i, ti)
+                ti.number[] = i # reset number to match new order
+            end
+            is_sorted_queue = true
+        else
+            is_sorted_queue = false
+        end
         if nworkers == 0
             length(cfg.worker_init_expr.args) > 0 && error("worker_init_expr is set, but will not run because number of workers is 0.")
             # This is where we disable printing for the serial executor case.
@@ -403,7 +451,7 @@ function _runtests_in_current_env(
                         @debugv 2 "Running GC"
                         GC.gc(true)
                     end
-                    is_non_pass = any_non_pass(ts)
+                    testitem.is_non_pass[] = is_non_pass = any_non_pass(ts)
                     if is_non_pass && run_number != max_runs
                         run_number += 1
                         @info "Retrying $(repr(testitem.name)). Run=$run_number."
@@ -438,32 +486,40 @@ function _runtests_in_current_env(
             end
             # Now all workers are started, we can begin processing test items.
             @info "Starting running test items"
-            starting = get_starting_testitems(testitems, nworkers)
+            starting = get_starting_testitems(testitems, nworkers; is_sorted=is_sorted_queue)
             @sync for (i, w) in enumerate(workers)
                 ti = starting[i]
                 @spawn begin
                     with_logger(original_logger) do
-                        manage_worker($w, $proj_name, $testitems, $ti, $cfg)
+                        manage_worker($w, $proj_name, $testitems, $ti, $cfg; worker_num=$i)
                     end
                 end
             end
         end
         Test.TESTSET_PRINT_ENABLE[] = true # reenable printing so our `finish` prints
+        # Let users know if tests are done, and if all of them ran (or if we failed fast).
+        # Print this above the final report as there might have been other logs printed
+        # since a failfast-cancellation was printed, but print it ASAP after tests finish
+        # in case any of the recording/reporting steps have an issue.
+        print_completion_summary(testitems; failedfast=(cfg.failfast && is_cancelled(testitems)))
         record_results!(testitems)
         cfg.report && write_junit_file(proj_name, dirname(projectfile), testitems.graph.junit)
-        if cfg.failfast && is_cancelled(testitems)
-            # Let users know if not all tests ran. Print this just above the final report as
-            # there might have been other logs printed since the cancellation was printed.
-            print_failfast_summary(testitems)
-        end
+        @debugv 1 "Calling Test.finish(testitems)"
         Test.finish(testitems) # print summary of total passes/failures/errors
     finally
         Test.TESTSET_PRINT_ENABLE[] = true
-        # Cleanup test setup logs
+        @debugv 1 "Cleaning up test setup logs"
         foreach(Iterators.filter(endswith(".log"), readdir(RETESTITEMS_TEMP_FOLDER[], join=true))) do logfile
-            rm(logfile; force=true)  # `force` to ignore error if file already cleaned up
+            try
+                # See https://github.com/JuliaTesting/ReTestItems.jl/issues/124
+                rm(logfile; force=true)  # `force` to ignore error if file already cleaned up
+            catch err
+                @debug "Error while attempting to remove $(logfile)" err
+            end
         end
+        @debugv 1 "Done cleaning up test setup logs"
     end
+    @debugv 1 "DONE"
     return nothing
 end
 
@@ -472,8 +528,10 @@ end
 function start_worker(proj_name, nworker_threads::String, worker_init_expr::Expr, ntestitems::Int; worker_num=nothing)
     w = Worker(; threads=nworker_threads)
     i = worker_num == nothing ? "" : " $worker_num"
+    proj = Base.active_project()
     # remote_fetch here because we want to make sure the worker is all setup before starting to eval testitems
     remote_fetch(w, quote
+        Base.set_active_project($proj)
         using ReTestItems, Test
         Test.TESTSET_PRINT_ENABLE[] = false
         const GLOBAL_TEST_CONTEXT = ReTestItems.TestContext($proj_name, $ntestitems)
@@ -572,8 +630,10 @@ function record_test_error!(testitem, msg, elapsed_seconds::Real=0.0)
     return testitem
 end
 
+# The provided `worker_num` is only for logging purposes, and not persisted as part of the worker.
 function manage_worker(
-    worker::Worker, proj_name::AbstractString, testitems::TestItems, testitem::Union{TestItem,Nothing}, cfg::_Config,
+    worker::Worker, proj_name::AbstractString, testitems::TestItems, testitem::Union{TestItem,Nothing}, cfg::_Config;
+    worker_num::Int
 )
     ntestitems = length(testitems.testitems)
     run_number = 1
@@ -581,7 +641,7 @@ function manage_worker(
     while testitem !== nothing
         ch = Channel{TestItemResult}(1)
         if memory_percent() > memory_threshold_percent
-            @warn "Memory usage ($(Base.Ryu.writefixed(memory_percent(), 1))%) is higher than threshold ($(Base.Ryu.writefixed(memory_threshold_percent, 1))%). Restarting worker process to try to free memory."
+            @warn "Memory usage ($(Base.Ryu.writefixed(memory_percent(), 1))%) is higher than threshold ($(Base.Ryu.writefixed(memory_threshold_percent, 1))%). Restarting process for worker $worker_num to try to free memory."
             terminate!(worker)
             wait(worker)
             worker = robust_start_worker(proj_name, cfg.nworker_threads, cfg.worker_init_expr, ntestitems)
@@ -621,7 +681,7 @@ function manage_worker(
                     @debugv 2 "Running GC on $worker"
                     remote_fetch(worker, :(GC.gc(true)))
                 end
-                is_non_pass = any_non_pass(ts)
+                testitem.is_non_pass[] = is_non_pass = any_non_pass(ts)
                 if is_non_pass && run_number != max_runs
                     run_number += 1
                     @info "Retrying $(repr(testitem.name)) on $worker. Run=$run_number."
@@ -637,7 +697,7 @@ function manage_worker(
                 close(timer)
             end
         catch e
-            @debugv 2 "Error" exception=e
+            @debugv 2 "Error: $e"
             # Handle the exception
             if e isa TimeoutException
                 if cfg.timeout_profile_wait > 0
@@ -679,7 +739,7 @@ function manage_worker(
                 run_number = 1
             else
                 run_number += 1
-                @info "Retrying $(repr(testitem.name)) on a new worker process. Run=$run_number."
+                @info "Retrying $(repr(testitem.name)) on a new worker $worker_num process. Run=$run_number."
             end
             # The worker was terminated, so replace it unless there are no more testitems to run
             if testitem !== nothing
@@ -689,7 +749,9 @@ function manage_worker(
             continue
         end
     end
+    @info "All tests on worker $worker_num completed. Closing $worker."
     close(worker)
+    @debugv 1 "Worker $worker_num closed: $(worker)"
     return nothing
 end
 
@@ -728,6 +790,19 @@ function nestedrelpath(path::T, startdir::AbstractString) where {T <: AbstractSt
     end
 end
 
+# Like `Base.walkdir` but does not descend into hidden directories (those starting with '.')
+function _walkdir(root)
+    return Channel{Tuple{String, Vector{String}, Vector{String}}}() do ch
+        for (dir, dirs, files) in Base.walkdir(root; topdown=true)
+            # Filter out hidden directories to prevent descending into them.
+            # Modifying `dirs` in-place works because walkdir uses it to determine
+            # which subdirectories to visit next (when topdown=true, the default).
+            filter!(d -> !startswith(d, '.'), dirs)
+            put!(ch, (dir, dirs, files))
+        end
+    end
+end
+
 # is `dir` the root of a subproject inside the current project?
 function _is_subproject(dir, current_projectfile)
     projectfile = _project_file(dir)
@@ -744,6 +819,7 @@ end
 
 # for each directory, kick off a recursive test-finding task
 # Returns (testitems::TestItems, setups::Dict{Symbol,TestSetup})
+# Assumes `isdir(project_root)`, which is guaranteed by `_runtests`.
 function include_testfiles!(project_name, projectfile, paths, ti_filter::TestItemFilter, verbose_results::Bool, report::Bool)
     project_root = dirname(projectfile)
     subproject_root = nothing  # don't recurse into directories with their own Project.toml.
@@ -762,8 +838,8 @@ function include_testfiles!(project_name, projectfile, paths, ti_filter::TestIte
         end
         return setups
     end
-    hidden_re = r"\.\w"
-    @sync for (root, d, files) in Base.walkdir(project_root)
+    # Use _walkdir to skip hidden directories
+    @sync for (root, d, files) in _walkdir(project_root)
         if subproject_root !== nothing && startswith(root, subproject_root)
             @debugv 1 "Skipping files in `$root` in subproject `$subproject_root`"
             continue
@@ -772,12 +848,11 @@ function include_testfiles!(project_name, projectfile, paths, ti_filter::TestIte
             continue
         end
         rpath = nestedrelpath(root, project_root)
-        startswith(rpath, hidden_re) && continue # skip hidden directories
         dir_node = DirNode(rpath; report, verbose=verbose_results)
         dir_nodes[rpath] = dir_node
         push!(get(dir_nodes, dirname(rpath), root_node), dir_node)
         for file in files
-            startswith(file, hidden_re) && continue # skip hidden files
+            startswith(file, '.') && continue # skip hidden files
             filepath = joinpath(root, file)
             # We filter here, rather than the testitem level, to make sure we don't
             # `include` a file that isn't supposed to be a test-file at all, e.g. its
@@ -959,13 +1034,8 @@ function should_skip(ti::TestItem)
     skip_body = deepcopy(ti.skip::Expr)
     softscope_all!(skip_body)
     # Run in a new module to not pollute `Main`.
-    # Need to store the result of the `skip` expression so we can check it.
-    mod_name = gensym(Symbol(:skip_, ti.name))
-    skip_var = gensym(:skip)
-    skip_mod_expr = :(module $mod_name; $skip_var = $skip_body; end)
-    skip_mod = Core.eval(Main, skip_mod_expr)
-    # Check what the expression evaluated to.
-    skip = getfield(skip_mod, skip_var)
+    mod = Module(Symbol(:skip_, ti.name))
+    skip = Core.eval(mod, skip_body)
     !isa(skip, Bool) && _throw_not_bool(ti, skip)
     return skip::Bool
 end
@@ -1094,10 +1164,10 @@ function runtestitem(
         # Handle exceptions thrown outside a `@test` in the body of the @testitem:
         # Copied from Test.@testset's catch block:
         # If an inner testset had `failfast=true` and there was a failure/error, then the root
-        # testset will throw a `TestFailFastError` to force the root testset to stop running.
-        # We don't need to record that `TestFailFastError`, since its not itself a test
+        # testset will throw a `Test.FailFastError` to force the root testset to stop running.
+        # We don't need to record that `Test.FailFastError`, since its not itself a test
         # error, it is just the mechanism used to interrupt tests.
-        if isa(err, TestFailFastError)
+        if is_failfast_error(err)
             failedfast = true
         else
             try
@@ -1106,8 +1176,8 @@ function runtestitem(
                     LineNumberNode(ti.line, ti.file)))
             catch err2
                 # If the root testset had `failfast=true` and itself threw an error outside
-                # of a test, then `record` will throw a `TestFailFastError`.
-                err2 isa TestFailFastError || rethrow()
+                # of a test, then `record` will throw a `Test.FailFastError`.
+                is_failfast_error(err2) || rethrow()
                 failedfast = true
             end
         end

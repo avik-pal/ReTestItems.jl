@@ -21,7 +21,7 @@ const TEST_PKG_DIR = joinpath(_TEST_DIR, "packages")
 
 # Note "DontPass.jl" is handled specifically below, as it's the package which doesn't have
 # passing tests. Other packages should pass tests and be added here:
-const TEST_PKGS = ("NoDeps.jl", "TestsInSrc.jl", "TestProjectFile.jl", "TestEndExpr.jl")
+const TEST_PKGS = ("NoDeps.jl", "TestsInSrc.jl", "TestProjectFile.jl", "TestEndExpr.jl", "TestOnlyDeps.jl")
 
 include(joinpath(_TEST_DIR, "_integration_test_tools.jl"))
 
@@ -45,18 +45,24 @@ end
 
 # test we can call runtests manually w/ directory
 @testset "manual `runtests(dir)`" begin
-    results = encased_testset() do
-        runtests(joinpath(TEST_PKG_DIR, "NoDeps.jl"))
+    using IOCapture
+    c = IOCapture.capture() do
+        encased_testset(() -> runtests(joinpath(TEST_PKG_DIR, "NoDeps.jl")))
     end
+    results = c.value
     @test n_passed(results) == 2  # NoDeps has two test files with a test each
+    @test contains(c.output, "[ Tests Completed: 2/2 test items were run.")
 end
 
 @testset "manual `runtests(file)`" begin
     # test we can point to a file at the base of the package (not just in `src` or `test`)
-    results = encased_testset() do
-        runtests(joinpath(TEST_PKG_DIR, "NoDeps.jl", "toplevel_tests.jl"))
+    using IOCapture
+    c = IOCapture.capture() do
+        encased_testset(() -> runtests(joinpath(TEST_PKG_DIR, "NoDeps.jl", "toplevel_tests.jl")))
     end
+    results = c.value
     @test n_passed(results) == 1
+    @test contains(c.output, "[ Tests Completed: 1/1 test items were run.")
 end
 
 @testset "`runtests(path)` auto finds testsetups" begin
@@ -80,50 +86,51 @@ end
 end
 
 @testset "Warn or error when not test file" begin
+    using ReTestItems: NoTestException
     pkg = joinpath(TEST_PKG_DIR, "TestsInSrc.jl")
 
     # warn if the path does not exist
     dne = joinpath(pkg, "does_not_exist")
-    dne_msg = "No such path \"$dne\""
+    dne_msg = "No such path $(repr(dne))"
     @test_logs (:warn, dne_msg) match_mode=:any begin
         runtests(dne)
     end
     # throw if `validate_paths`
-    @test_throws ArgumentError(dne_msg) runtests(dne; validate_paths=true)
+    @test_throws NoTestException(dne_msg) runtests(dne; validate_paths=true)
     # test setting `validate_paths` via environment variable
     withenv("RETESTITEMS_VALIDATE_PATHS" => 1) do
-        @test_throws ArgumentError(dne_msg) runtests(dne)
+        @test_throws NoTestException(dne_msg) runtests(dne)
     end
 
     # warn if the file is not a test file
     file = joinpath(pkg, "src", "foo.jl")
     @assert isfile(file)
-    file_msg = "\"$file\" is not a test file"
+    file_msg = "$(repr(file)) is not a test file"
     @test_logs (:warn, file_msg) match_mode=:any begin
         runtests(file)
     end
     # throw if `validate_paths`
-    @test_throws ArgumentError(file_msg) runtests(file; validate_paths=true)
+    @test_throws NoTestException(file_msg) runtests(file; validate_paths=true)
 
     # Warn for each invalid path
     @test_logs (:warn, dne_msg) (:warn, file_msg) match_mode=:any begin
         runtests(dne, file)
     end
     # Throw on first invalid path if `validate_paths`
-    @test_throws ArgumentError(dne_msg) runtests(dne, file; validate_paths=true)
-    @test_throws ArgumentError(file_msg) runtests(file, dne; validate_paths=true)
+    @test_throws NoTestException(dne_msg) runtests(dne, file; validate_paths=true)
+    @test_throws NoTestException(file_msg) runtests(file, dne; validate_paths=true)
 
     # Warn for each invalid path and still run valid ones
     test_file = joinpath(pkg, "src", "foo_test.jl")
     @assert isfile(test_file)
-    results = @test_logs (:warn, "No such path \"$dne\"") (:warn, "\"$file\" is not a test file") match_mode=:any begin
+    results = @test_logs (:warn, "No such path $(repr(dne))") (:warn, "$(repr(file)) is not a test file") match_mode=:any begin
         encased_testset() do
             runtests(test_file, dne, file)
         end
     end
     @test n_tests(results) == 2 # foo_test.jl has 2 tests
     # Throw on first invalid path, even if some are valid, if `validate_paths`
-    @test_throws ArgumentError(dne_msg) runtests(test_file, dne, file; validate_paths=true)
+    @test_throws NoTestException(dne_msg) runtests(test_file, dne, file; validate_paths=true)
 end
 
 @testset "filter `runtests(func, x)`" begin
@@ -136,10 +143,7 @@ end
     @assert n_total > 0
 
     # can exclude everything
-    results = encased_testset() do
-        runtests(x->false, pkg)
-    end
-    @test n_tests(results) == 0
+    @test_throws ReTestItems.NoTestException runtests(x->false, pkg)
 
     # there is a `@testitem "bar"` -- filter to just that testitem.
     results = encased_testset() do
@@ -148,10 +152,7 @@ end
     @test n_passed(results) > 0
     @test n_tests(results) < n_total
 
-    results = encased_testset() do
-        runtests(ti -> contains(ti.name, "bar_"), pkg)
-    end
-    @test n_tests(results) == 0
+    @test_throws ReTestItems.NoTestException runtests(ti -> contains(ti.name, "bar_"), pkg)
 
     # there is a `@testitem "b"` tagged `:b_tag` -- filter to just that testitem.
     results = encased_testset() do
@@ -167,43 +168,17 @@ end
     @test n_passed(results) == 1
     @test n_tests(results) == 1
 
-    results = encased_testset() do
-        runtests(ti -> :b_tag in ti.tags, pkg; name="b", tags=:nope)
-    end
-    @test n_passed(results) == 0
-    @test n_tests(results) == 0
+    @test_throws ReTestItems.NoTestException runtests(ti -> :b_tag in ti.tags, pkg; name="nope")
 
-    results = encased_testset() do
-        runtests(ti -> :b_tag in ti.tags, pkg; name="nope")
-    end
-    @test n_passed(results) == 0
-    @test n_tests(results) == 0
-
-    ## TODO: Are we okay to remove these tests?
-    ## passing a `shouldrun` function as the first arg has never been documented, and
-    ## when it has come up as a workaround for people, we have only ever said you can filter
-    ## on `ti.name` and `ti.tags`, so i think it is okay to remove these tests that use
-    ## `ti.file` (and not support filtering on `ti.file)
-    ##
-    # # there is a `bar_test.jl` -- filter to just that file.
-    # results = encased_testset() do
-    #     runtests(ti -> contains(ti.file, "bar_"), pkg)
-    # end
-    # @test n_passed(results) > 0
-    # @test n_tests(results) < n_total
-
-    # # test we can filter by directory (all tests are in `src/`)
-    # results_test_dir = encased_testset() do
-    #     runtests(ti -> startswith(ti.file, "$pkg/test"), pkg)
-    # end
-    # results_src_dir = encased_testset() do
-    #     runtests(ti -> startswith(ti.file, "$pkg/src"), pkg)
-    # end
-    # @test n_tests(results_src_dir) == n_total
-    # @test n_tests(results_test_dir) == 0
+    @test_throws ReTestItems.NoTestException runtests(ti -> :b_tag in ti.tags, pkg; name="b", tags=[:nope])
 
     # can only filter on `ti.name` and `ti.tags` (at least for now)
-    @test_throws "no field file" runtests(ti -> contains(ti.file, "bar_"), pkg)
+    expected = if VERSION < v"1.12.0-DEV"
+        "no field file"
+    else
+        "no field `file`"
+    end
+    @test_throws expected runtests(ti -> contains(ti.file, "bar_"), pkg)
 end
 
 @testset "`@testitem` scoping rules" begin
@@ -273,20 +248,28 @@ end
 nworkers = 2
 @testset "runtests with nworkers = $nworkers" verbose=true begin
     @testset "Pkg.test() $pkg" for pkg in TEST_PKGS
-        results = with_test_package(pkg) do
-            withenv("RETESTITEMS_NWORKERS" => nworkers) do
-                Pkg.test()
+        c = IOCapture.capture() do
+            with_test_package(pkg) do
+                withenv("RETESTITEMS_NWORKERS" => nworkers) do
+                    Pkg.test()
+                end
             end
         end
+        results = c.value
         @test all_passed(results)
+        @test contains(c.output, "[ Tests Completed")
     end
     @testset "Pkg.test() DontPass.jl" begin
-        results = with_test_package("DontPass.jl") do
-            withenv("RETESTITEMS_NWORKERS" => 2) do
-                Pkg.test()
+        c = IOCapture.capture() do
+            with_test_package("DontPass.jl") do
+                withenv("RETESTITEMS_NWORKERS" => 2) do
+                    Pkg.test()
+                end
             end
         end
+        results = c.value
         @test length(non_passes(results)) > 0
+        @test contains(c.output, "[ Tests Completed")
     end
 end
 
@@ -386,6 +369,7 @@ end
         Test.print_test_results(testset)
     end
     # Test with `contains` rather than `match` so failure print an informative message.
+    if !Base.Sys.iswindows() # so we can hardcode filepaths to keep the test readable
     @test contains(
         c.output,
         r"""
@@ -413,6 +397,7 @@ end
               foo                         \|    2      2  \s*\d*.\ds
         """
     )
+    end
     # verbose_results=false
     testset = with_test_package("TestsInSrc.jl") do
         runtests(verbose_results=false)
@@ -447,9 +432,9 @@ end
                 @test !contains(c.output, "tests done")
             end
             if debug
-                @test contains(c.output, "Debug:")
+                @test contains(c.output, "DEBUG @")
             else
-                @test !contains(c.output, "Debug:")
+                @test !contains(c.output, "DEBUG @")
             end
             # Test we have the expected summary table
             testset = c.value
@@ -499,14 +484,11 @@ end
     @test n_tests(results) == 1
 
     # There is no test with tag3
-    results = encased_testset(()->runtests(file, tags=[:tag1, :tag3]))
-    @test n_tests(results) == 0
+    @test_throws ReTestItems.NoTestException runtests(file, tags=[:tag1, :tag3])
 
-    results = encased_testset(()->runtests(file, tags=[:tag3]))
-    @test n_tests(results) == 0
+    @test_throws ReTestItems.NoTestException runtests(file, tags=[:tag3])
 
-    results = encased_testset(()->runtests(file, tags=:tag3))
-    @test n_tests(results) == 0
+    @test_throws ReTestItems.NoTestException runtests(file, tags=:tag3)
 end
 
 @testset "filter `runtests(x; name)`" begin
@@ -518,8 +500,7 @@ end
     results = encased_testset(()->runtests(file))
     @assert n_tests(results) == 3
 
-    results = encased_testset(()->runtests(file, name=""))
-    @test n_tests(results) == 0
+    @test_throws ReTestItems.NoTestException runtests(file, name="")
 
     results = encased_testset(()->runtests(file, name="Test item no tags"))
     @test n_tests(results) == 1
@@ -527,8 +508,7 @@ end
     results = encased_testset(()->runtests(file, name=@view "Test item no tags"[begin:end]))
     @test n_tests(results) == 1
 
-    results = encased_testset(()->runtests(file, name=r"No such name in that file"))
-    @test n_tests(results) == 0
+    @test_throws ReTestItems.NoTestException runtests(file, name=r"No such name in that file")
 
     results = encased_testset(()->runtests(file, name=r"Test item"))
     @test n_tests(results) == 3
@@ -550,14 +530,11 @@ end
     @assert n_tests(results) == 3
 
 
-    results = encased_testset(()->runtests(file, name="", tags=Symbol[]))
-    @test n_tests(results) == 0
+    @test_throws ReTestItems.NoTestException runtests(file, name="", tags=Symbol[])
 
-    results = encased_testset(()->runtests(file, name=r".", tags=:tag3))
-    @test n_tests(results) == 0
+    @test_throws ReTestItems.NoTestException runtests(file, name=r".", tags=:tag3)
 
-    results = encased_testset(()->runtests(file, name="", tags=:tag3))
-    @test n_tests(results) == 0
+    @test_throws ReTestItems.NoTestException runtests(file, name="", tags=:tag3)
 
     results = encased_testset(()->runtests(file, name=r".", tags=Symbol[]))
     @test n_tests(results) == 3
@@ -581,55 +558,50 @@ end
     results = encased_testset(()->runtests(file))
     @assert n_tests(results) == 3
 
-    results = encased_testset(()->runtests(ti-> false, file, name="", tags=:tag3))
-    @test n_tests(results) == 0
-
-    results = encased_testset(()->runtests(ti-> false, file, name="", tags=Symbol[]))
-    @test n_tests(results) == 0
-
-    results = encased_testset(()->runtests(ti-> false, file, name=r".", tags=:tag3))
-    @test n_tests(results) == 0
-
-    results = encased_testset(()->runtests(ti-> true, file, name="", tags=:tag3))
-    @test n_tests(results) == 0
-
-    results = encased_testset(()->runtests(ti-> true, file, name="", tags=Symbol[]))
-    @test n_tests(results) == 0
-
-    results = encased_testset(()->runtests(ti-> true, file, name=r".", tags=:tag3))
-    @test n_tests(results) == 0
-
-    results = encased_testset(()->runtests(ti-> false, file, name=r".", tags=Symbol[]))
-    @test n_tests(results) == 0
+    @test_throws ReTestItems.NoTestException runtests(ti-> false, file, name="",   tags=:tag3)
+    @test_throws ReTestItems.NoTestException runtests(ti-> false, file, name=r".", tags=:tag3)
+    @test_throws ReTestItems.NoTestException runtests(ti-> true,  file, name="",   tags=:tag3)
+    @test_throws ReTestItems.NoTestException runtests(ti-> true,  file, name="",   tags=Symbol[])
+    @test_throws ReTestItems.NoTestException runtests(ti-> true,  file, name=r".", tags=:tag3)
+    @test_throws ReTestItems.NoTestException runtests(ti-> false, file, name=r".", tags=Symbol[])
 
     results = encased_testset(()->runtests(ti-> true, file, name=r".", tags=Symbol[]))
     @test n_tests(results) == 3
 end
 
 @testset "Warn on empty test set -- integration test" begin
+    fullpath = joinpath(TEST_FILES_DIR, "_empty_testsets_tests.jl")
+    relfpath = relpath(fullpath, pkgdir(ReTestItems))
     @test_logs (:warn, """
-    Test item "Warn on empty test set -- integration test" at test/testfiles/_empty_testsets_tests.jl:1 contains test sets without tests:
+    Test item "Warn on empty test set -- integration test" at $relfpath:1 contains test sets without tests:
     "Empty testset"
     "Inner empty testset"
     """) match_mode=:any begin
-        ReTestItems.runtests(joinpath(TEST_FILES_DIR, "_empty_testsets_tests.jl"))
+        ReTestItems.runtests(fullpath)
     end
 end
 
 @testset "log capture for an errored TestSetup" begin
+    path = joinpath("test", "error_in_setup_test.jl")
     c = IOCapture.capture() do
         results = with_test_package("DontPass.jl") do
-            runtests("test/error_in_setup_test.jl"; nworkers=1)
+            runtests(path; nworkers=1)
         end
     end
+if Base.Sys.iswindows()
+    @test occursin(
+        "\e[36m\e[1mCaptured logs\e[22m\e[39m for test setup \"SetupThatErrors\" (dependency of \"bad setup, good test\") at",
+        replace(c.output, r" on worker \d+" => "")
+    )
+else
     @test occursin("""
-    \e[36m\e[1mCaptured logs\e[22m\e[39m for test setup \"SetupThatErrors\" (dependency of \"bad setup, good test\") at \e[39m\e[1mtest/error_in_setup_test.jl:1\e[22m
+    \e[36m\e[1mCaptured logs\e[22m\e[39m for test setup \"SetupThatErrors\" (dependency of \"bad setup, good test\") at \e[39m\e[1m$(path):1\e[22m
     SetupThatErrors msg
     """,
     replace(c.output, r" on worker \d+" => ""))
 
     @test occursin("""
-    \e[36m\e[1mCaptured logs\e[22m\e[39m for test setup \"SetupThatErrors\" (dependency of \"bad setup, bad test\") at \e[39m\e[1mtest/error_in_setup_test.jl:1\e[22m
+    \e[36m\e[1mCaptured logs\e[22m\e[39m for test setup \"SetupThatErrors\" (dependency of \"bad setup, bad test\") at \e[39m\e[1m$(path):1\e[22m
     SetupThatErrors msg
     """,
     replace(c.output, r" on worker \d+" => ""))
@@ -638,19 +610,20 @@ end
     # that we don't accumulate logs from all previous failed attempts (which would get
     # really spammy if the test setup is used by 100 test items).
     @test !occursin("""
-        \e[36m\e[1mCaptured logs\e[22m\e[39m for test setup \"SetupThatErrors\" (dependency of \"bad setup, good test\") at \e[39m\e[1mtest/error_in_setup_test.jl:1\e[22m
+        \e[36m\e[1mCaptured logs\e[22m\e[39m for test setup \"SetupThatErrors\" (dependency of \"bad setup, good test\") at \e[39m\e[1m$(path):1\e[22m
         SetupThatErrors msg
         SetupThatErrors msg
         """,
         replace(c.output, r" on worker \d+" => "")
     )
     @test !occursin("""
-        \e[36m\e[1mCaptured logs\e[22m\e[39m for test setup \"SetupThatErrors\" (dependency of \"bad setup, bad test\") at \e[39m\e[1mtest/error_in_setup_test.jl:1\e[22m
+        \e[36m\e[1mCaptured logs\e[22m\e[39m for test setup \"SetupThatErrors\" (dependency of \"bad setup, bad test\") at \e[39m\e[1m$(path):1\e[22m
         SetupThatErrors msg
         SetupThatErrors msg
         """,
         replace(c.output, r" on worker \d+" => "")
     )
+end # iswindows
 end
 
 @testset "test crashing testitem" begin
@@ -671,7 +644,8 @@ end
     # Test the error is as expected
     err = only(non_passes(results))
     @test err.test_type == :nontest_error
-    @test err.value == string(ErrorException("Worker process aborted (signal=6) running test item \"Abort\" (run=1)"))
+    sig = Base.Sys.iswindows() ? 0 : 6
+    @test err.value == string(ErrorException("Worker process aborted (signal=$(sig)) running test item \"Abort\" (run=1)"))
 end
 
 @testset "test retrying failing testitem" begin
@@ -802,8 +776,7 @@ end
 @testset "`runtests` finds no testitems" begin
     file = joinpath(TEST_FILES_DIR, "_empty_file_test.jl")
     for nworkers in (0, 1)
-        results = encased_testset(()->runtests(file; nworkers))
-        @test n_tests(results) == 0
+        @test_throws ReTestItems.NoTestException runtests(file; nworkers)
     end
 end
 
@@ -887,14 +860,18 @@ end
         @test n_tests(results) == 2
         results = encased_testset(() -> runtests(file; tags=[:xyz]))
         @test n_tests(results) == 1
-        results = encased_testset(() -> runtests(filter_func, file))
-        @test n_tests(results) == 0
+        @test_throws ReTestItems.NoTestException runtests(filter_func, file)
     end
 end
 
 @testset "Duplicate names in same file throws" begin
     file = joinpath(TEST_FILES_DIR, "_duplicate_names_test.jl")
-    expected_msg = Regex("Duplicate test item name `dup` in file `test/testfiles/_duplicate_names_test.jl` at line 4")
+    relfpath = relpath(file, pkgdir(ReTestItems))
+    expected_msg = if Base.Sys.iswindows()
+        Regex("Duplicate test item name `dup` in file")
+    else
+        Regex("Duplicate test item name `dup` in file `$(relfpath)` at line 4")
+    end
     @test_throws expected_msg runtests(file; nworkers=0)
     @test_throws expected_msg runtests(file; nworkers=1)
 end
@@ -953,51 +930,58 @@ end
         return logs
     end
 
-    @testset "timeout_profile_wait=0 means no CPU profile" begin
-    capture_timeout_profile(0) do logs
-        @test !occursin("Information request received", logs)
-        end
-    end
-
-
-    default_peektime = Profile.get_peek_duration()
-    @testset "non-zero timeout_profile_wait means we collect a CPU profile" begin
-    capture_timeout_profile(5) do logs
-        @test occursin("Information request received. A stacktrace will print followed by a $(default_peektime) second profile", logs)
-            @test count(r"pthread_cond_wait|__psych_cvwait", logs) > 0 # the stacktrace was printed (will fail on Windows)
-        @test occursin("Profile collected.", logs)
-        end
-    end
-
-
-    @testset "`set_peek_duration` is respected in `worker_init_expr`" begin
-    capture_timeout_profile(5, worker_init_expr=:(using Profile; Profile.set_peek_duration($default_peektime + 1.0))) do logs
-        @test occursin("Information request received. A stacktrace will print followed by a $(default_peektime + 1.0) second profile", logs)
-            @test count(r"pthread_cond_wait|__psych_cvwait", logs) > 0 # the stacktrace was printed (will fail on Windows)
-        @test occursin("Profile collected.", logs)
-        end
-    end
-
-
-    # The RETESTITEMS_TIMEOUT_PROFILE_WAIT environment variable can be used to set the timeout_profile_wait.
-    @testset "RETESTITEMS_TIMEOUT_PROFILE_WAIT environment variable" begin
-    withenv("RETESTITEMS_TIMEOUT_PROFILE_WAIT" => "5") do
-        capture_timeout_profile(nothing) do logs
-            @test occursin("Information request received", logs)
-                @test count(r"pthread_cond_wait|__psych_cvwait", logs) > 0 # the stacktrace was printed (will fail on Windows)
-            @test occursin("Profile collected.", logs)
+    if Base.Sys.iswindows()
+        @testset "Windows not supported" begin
+            capture_timeout_profile(1) do logs
+                @test occursin("CPU profiles on timeout is not supported on Windows, ignoring `timeout_profile_wait`", logs)
             end
         end
-    end
-
-    # The profile is collected for each worker thread.
-    @testset "CPU profile with $(repr(log_capture))" for log_capture in (:eager, :batched)
-        capture_timeout_profile(5, nworker_threads=VERSION >= v"1.9" ? "3,2" : "3", logs=log_capture) do logs
-        @test occursin("Information request received", logs)
-            @test count(r"pthread_cond_wait|__psych_cvwait", logs) > 0 # the stacktrace was printed (will fail on Windows)
-        @test occursin("Profile collected.", logs)
+    else
+        @testset "timeout_profile_wait=0 means no CPU profile" begin
+            capture_timeout_profile(0) do logs
+                @test !occursin("Information request received", logs)
+            end
         end
-    end
+
+        default_peektime = Profile.get_peek_duration()
+        @testset "non-zero timeout_profile_wait means we collect a CPU profile" begin
+            capture_timeout_profile(5) do logs
+                @test occursin("Information request received. A stacktrace will print followed by a $(default_peektime) second profile", logs)
+                @test count(r"pthread_cond_wait|__psynch_cvwait", logs) > 0 # the stacktrace was printed (will fail on Windows)
+                @test occursin("Profile collected.", logs)
+            end
+        end
+
+
+        @testset "`set_peek_duration` is respected in `worker_init_expr`" begin
+            capture_timeout_profile(5, worker_init_expr=:(using Profile; Profile.set_peek_duration($default_peektime + 1.0))) do logs
+                @test occursin("Information request received. A stacktrace will print followed by a $(default_peektime + 1.0) second profile", logs)
+                @test count(r"pthread_cond_wait|__psynch_cvwait", logs) > 0 # the stacktrace was printed (will fail on Windows)
+                @test occursin("Profile collected.", logs)
+            end
+        end
+
+
+        # The RETESTITEMS_TIMEOUT_PROFILE_WAIT environment variable can be used to set the timeout_profile_wait.
+        @testset "RETESTITEMS_TIMEOUT_PROFILE_WAIT environment variable" begin
+            withenv("RETESTITEMS_TIMEOUT_PROFILE_WAIT" => "5") do
+                capture_timeout_profile(nothing) do logs
+                    @test occursin("Information request received", logs)
+                    @test count(r"pthread_cond_wait|__psynch_cvwait", logs) > 0 # the stacktrace was printed (will fail on Windows)
+                    @test occursin("Profile collected.", logs)
+                end
+            end
+        end
+
+        # The profile is collected for each worker thread.
+        @testset "CPU profile with $(repr(log_capture))" for log_capture in (:eager, :batched)
+            capture_timeout_profile(5, nworker_threads=VERSION >= v"1.9" ? "3,2" : "3", logs=log_capture) do logs
+                @test occursin("Information request received", logs)
+                @test count(r"pthread_cond_wait|__psynch_cvwait", logs) > 0 # the stacktrace was printed (will fail on Windows)
+                @test occursin("Profile collected.", logs)
+            end
+        end
+    end # iswindows
 end
 
 @testset "worker always crashes immediately" begin
@@ -1198,7 +1182,7 @@ end
         # monkey-patch the internal `memory_percent` function to return a fixed value, so we
         # can control if we hit the `memory_threshold`.
         @eval ReTestItems.memory_percent() = 83.1
-        expected_warning = "Warning: Memory usage (83.1%) is higher than threshold (7.0%). Restarting worker process to try to free memory."
+        expected_warning = "Warning: Memory usage (83.1%) is higher than threshold (7.0%). Restarting process for worker 1 to try to free memory."
 
         # Pass `memory_threshold` keyword, and hit the memory threshold.
         c1 = IOCapture.capture() do
@@ -1254,6 +1238,7 @@ end
 end
 
 @testset "logs are aligned" begin
+    ReTestItems.reset_test_status!()
     file = joinpath(TEST_FILES_DIR, "_skip_tests.jl")
     c1 = IOCapture.capture() do
         encased_testset(()->runtests(file))
@@ -1320,7 +1305,8 @@ end
         :crash   => "_failfast_crash_tests.jl",
     )
         testitem_timeout = 5
-        file = joinpath(TEST_FILES_DIR, filename)
+        fullpath = joinpath(TEST_FILES_DIR, filename)
+        relfpath = relpath(fullpath, pkgdir(ReTestItems))
         # For 0 or 1 workers, we expect to fail on the second testitem out of 3.
         # If running with 3 workers, then all 3 testitems will be running in parallel,
         # so we expect to see all 3 testitems run, even though one fails.
@@ -1331,8 +1317,9 @@ end
                 @test_skip case
                 continue
             end
+            ReTestItems.reset_test_status!()
             c = IOCapture.capture() do
-                encased_testset(() -> runtests(file; nworkers, testitem_timeout, retries=1, failfast=true))
+                encased_testset(() -> runtests(fullpath; nworkers, testitem_timeout, retries=1, failfast=true))
             end
             results = c.value
             if nworkers == 3
@@ -1345,7 +1332,7 @@ end
             # @show c.output
             @test contains(c.output, "Retrying")  # check retries are happening
             @test count(r"\[ Fail Fast:", c.output) == 2
-            msg = "[ Fail Fast: Test item \"bad\" at test/testfiles/$filename:4 failed. Cancelling tests."
+            msg = "[ Fail Fast: Test item \"bad\" at $relfpath:4 failed. Cancelling tests."
             @test contains(c.output, msg)
             if nworkers == 3
                 @test contains(c.output, "[ Fail Fast: 3/3 test items were run.")
@@ -1505,6 +1492,112 @@ end
 
 @testset "`test_end_expr` must be `:block`" begin
     @test_throws "`test_end_expr` must be a `:block` expression" runtests(; test_end_expr=:(@assert false))
+end
+
+@testset "throw if no test items" begin
+    using ReTestItems: NoTestException
+    exc = NoTestException("No test items found.")
+    @test_throws exc runtests(joinpath(TEST_FILES_DIR, "_empty_file_test.jl"))
+    @test_throws exc runtests(joinpath(TEST_FILES_DIR, "_empty_file_test.jl"); nworkers=1)
+    @test_throws exc runtests(joinpath(TEST_FILES_DIR, "_happy_tests.jl"); name="blahahahaha_nope")
+    @test_throws exc runtests(joinpath(TEST_FILES_DIR, "_happy_tests.jl"); tags=[:blahahahaha_nope])
+end
+
+@testset "bugfix: don't overcount when nworkers > ntestitems" begin
+    using IOCapture
+    nworkers = 4
+    c = IOCapture.capture() do
+        encased_testset(() -> runtests(joinpath(TEST_FILES_DIR, "_happy_tests.jl"); nworkers))
+    end
+    results = c.value
+    @assert nworkers > n_tests(results)
+    @assert n_tests(results) == 3
+    # the bug was printing `4/3`
+    @test contains(c.output, "3/3 test items were run.")
+end
+
+@testset "failures_first" verbose=true begin
+    using IOCapture
+    # we use logs to tell us the order in which tests were run.
+    function testitems_runorder(logstr::String)
+        re = r"START \((?<num>\d)/\d\) test item \"(?<name>.*)\""
+        names = [String(m[:name]) for m in eachmatch(re, logstr)]
+        order = [parse(Int, m[:num]) for m in eachmatch(re, logstr)]
+        return names[order]
+    end
+    file = joinpath(TEST_FILES_DIR, "_failures_first_tests.jl")
+    @testset for nworkers in (0, 1)
+        ReTestItems.reset_test_status!()
+        for run in (1, 2)
+            c = IOCapture.capture() do
+                encased_testset(()->runtests(file; failures_first=true, nworkers))
+            end
+            results = c.value
+            @test n_tests(results) == 4
+            @test n_passed(results) == 2
+            tis = testitems_runorder(c.output)
+            if run == 1
+                @test tis == ["a. pass", "b. fail", "c. pass", "d. fail"]
+            else
+                @test tis == ["b. fail", "d. fail", "a. pass", "c. pass"]
+            end
+        end
+        # run a subset of tests
+        name = r"^a|^d"
+        c = IOCapture.capture() do
+            encased_testset(()->runtests(file; failures_first=true, nworkers, name))
+        end
+        results = c.value
+        @test n_tests(results) == 2
+        @test n_passed(results) == 1
+        tis = testitems_runorder(c.output)
+        @test tis == ["d. fail", "a. pass"]
+        # run including new tests
+        file2 = joinpath(TEST_FILES_DIR, "_happy_tests.jl")
+        c = IOCapture.capture() do
+            encased_testset(()->runtests(file, file2; failures_first=true, nworkers))
+        end
+        results = c.value
+        @test n_tests(results) == 4 + 3
+        @test n_passed(results) == 2 + 3
+        tis = testitems_runorder(c.output)
+        new_tests = ["happy 1", "happy 2", "happy 3"]
+        @test tis == ["b. fail", "d. fail", new_tests..., "a. pass", "c. pass"]
+    end
+    @testset "nworkers=2" begin
+        nworkers = 2
+        ReTestItems.reset_test_status!()
+        for run in (1, 2)
+            c = IOCapture.capture() do
+                encased_testset(()->runtests(file; failures_first=true, nworkers))
+            end
+            results = c.value
+            @test n_tests(results) == 4
+            tis = testitems_runorder(c.output)
+            if run == 1
+                # The 2 workers grab evenly spaced out testitems, starting with the first
+                # one, hence a. and c.
+                @test Set(tis[1:2]) == Set(["a. pass", "c. pass"])
+                @test Set(tis[3:4]) == Set(["b. fail", "d. fail"])
+            else
+                # The 2 workers should get the failures first, hence b. and d.
+                @test Set(tis[1:2]) == Set(["b. fail", "d. fail"])
+                @test Set(tis[3:4]) == Set(["a. pass", "c. pass"])
+            end
+        end
+    end
+end
+
+# https://github.com/JuliaTesting/ReTestItems.jl/issues/228
+@testset "issues/228 workers always activate test env" begin
+    using ReTestItems
+    pkg = joinpath(TEST_PKG_DIR, "TestOnlyDeps.jl")
+    cmd = ```
+        $(Base.julia_cmd()) --project=$(pkg) -e '
+            using ReTestItems, TestOnlyDeps
+            runtests(TestOnlyDeps; nworkers=1)'
+        ```
+    run(addenv(cmd, "JULIA_PROJECT" => pkg))
 end
 
 end # integrationtests.jl testset

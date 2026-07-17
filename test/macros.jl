@@ -230,7 +230,7 @@ end
 @testset "testitem `_id` keyword" begin
     # Should default to `repr(hash(name, hash(file)))` where `file` is relative to the root
     # of the project being tested.
-    file = "test/macros.jl" # this file
+    file = joinpath("test, macros.jl") # this file
     # set the source to be this file, so that the test is valid even when run in the REPL.
     ti1 = @testitem "one" _run=false _source=LineNumberNode(@__LINE__, file) begin; end;
     @test ti1.id == repr(hash("one", hash(file)))
@@ -247,7 +247,7 @@ end
     expected = VERSION < v"1.8" ? LoadError : "must be passed a string"
     @test_throws expected (@eval @testitem("four", _id=1, _run=false, begin end))
     # Cannot detect type of `id` at macro-expansion time, so throws run-time error
-    expected = VERSION < v"1.8" ? MethodError : "MethodError: Cannot `convert` an object of type UInt64 to an object of type String"
+    expected = VERSION < v"1.8" ? MethodError : "MethodError: Cannot `convert` an object of type $(UInt) to an object of type String"
     @test_throws expected (@eval @testitem("five", _id=hash("five"), _run=false, begin end))
 end
 
@@ -419,6 +419,46 @@ end
         end
     )
 end
+
+@testset "testitem with `default_imports`" begin
+    ti = @testitem "default_imports" default_imports=true _run=false begin
+        @test @isdefined Test
+        @test @isdefined ReTestItems
+    end
+    @test ti.default_imports == true
+    res = ReTestItems.runtestitem(ti)
+    @test n_passed(res) == 2
+
+    ti = @testitem "no_default_imports" default_imports=false _run=false begin
+        # use `@assert` since we cannot use `@test`
+        @assert !(@isdefined Test)
+        @assert !(@isdefined ReTestItems)
+    end
+    @test ti.default_imports == false
+    ReTestItems.runtestitem(ti) # check `@assert` not triggered
+
+    @test_throws "`default_imports` keyword must be passed a `Bool`" (
+        @eval @testitem "Bad" default_imports=1 begin
+            @test true
+        end
+    )
+end
+
+@testset "testitem with unrecognised keyword" begin
+    @test_throws "unknown `@testitem` keyword arg `quux`" (
+        @eval @testitem "Bad" quux=1 begin
+            @test true
+        end
+    )
+end
+
+@testset "testitem without a body" begin
+    @test_throws "expected `@testitem` to have a body" (@eval @testitem "wrong")
+    @test_throws "expected `@testitem` to have a body" (@eval @testitem "wrong" @test 1==1)
+    @test_throws "expected `@testitem` to have a body" (@eval @testitem "wrong" let @test 1==1 end)
+    @test_throws "expected `@testitem` to have a body" (@eval @testitem "wrong" quote @test 1==1 end)
+end
+
 
 #=
 NOTE:
